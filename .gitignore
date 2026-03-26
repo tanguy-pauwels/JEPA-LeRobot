@@ -1,0 +1,72 @@
+# OS-specific
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Project-specific Data & Outputs
+/datasets/
+/comparison_runs/
+/lerobot_policy_lewm/outputs/
+outputs/
+checkpoints/
+logs/
+
+# Weights & Biases
+wandb/
+.wandb/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environments
+venv/
+ENV/
+env/
+venv.bak/
+env.bak/
+.env
+.venv
+.venv312/
+.python-version
+
+# Deep Learning / Model Weights
+*.ckpt
+*.safetensors
+*.pth
+*.pt
+*.onnx
+*.weights
+*.h5
+*.pb
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+.ipynb_checkpoints/
