@@ -54,7 +54,7 @@ class LeWMPolicy(PreTrainedPolicy):
             num_proj=self.config.sigreg_num_proj,
         )
 
-        self._image_key = next(iter(self.config.image_features.keys()))
+        self._image_key = self.config.selected_image_key
         self.reset()
 
     def get_optim_params(self) -> dict:

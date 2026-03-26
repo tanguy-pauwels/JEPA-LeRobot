@@ -5,7 +5,7 @@ from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot_policy_lewm.configuration_lewm import LeWMConfig
 
 
-def test_validate_features_fails_on_multiple_images():
+def test_validate_features_fails_on_multiple_images_without_matching_preferred_key():
     cfg = LeWMConfig(
         input_features={
             "observation.image": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 224, 224)),
@@ -15,8 +15,21 @@ def test_validate_features_fails_on_multiple_images():
         device="cpu",
     )
 
-    with pytest.raises(ValueError, match="exactly 1 visual feature"):
+    with pytest.raises(ValueError, match="preferred_image_key"):
         cfg.validate_features()
+
+
+def test_validate_features_selects_laptop_camera_when_available():
+    cfg = LeWMConfig(
+        input_features={
+            "observation.images.laptop": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 224, 224)),
+            "observation.images.phone": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 224, 224)),
+        },
+        output_features={"action": PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
+        device="cpu",
+    )
+    cfg.validate_features()
+    assert cfg.selected_image_key == "observation.images.laptop"
 
 
 def test_validate_features_fails_without_action():

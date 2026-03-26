@@ -21,6 +21,7 @@ class LeWMConfig(PreTrainedConfig):
     embed_dim: int = 192
     action_head_hidden_dim: int = 512
     debug_metrics: bool = False
+    preferred_image_key: str | None = "observation.images.laptop"
     use_world_model_loss: bool = True
     world_model_predictor: str = "ar"
     loss_weight_action: float = 1.0
@@ -70,12 +71,40 @@ class LeWMConfig(PreTrainedConfig):
         return None
 
     def validate_features(self) -> None:
-        if len(self.image_features) != 1:
-            raise ValueError(
-                f"LeWM policy expects exactly 1 visual feature. Got keys: {list(self.image_features.keys())}"
-            )
+        image_keys = list(self.image_features.keys())
+        if len(image_keys) == 0:
+            raise ValueError("LeWM policy requires at least one visual feature.")
+        if len(image_keys) > 1:
+            if self.preferred_image_key is None:
+                raise ValueError(
+                    "LeWM policy received multiple visual features. "
+                    "Set policy.preferred_image_key to one of: "
+                    f"{image_keys}"
+                )
+            if self.preferred_image_key not in image_keys:
+                raise ValueError(
+                    "LeWM policy preferred_image_key was not found in visual features. "
+                    f"preferred_image_key='{self.preferred_image_key}', available={image_keys}"
+                )
         if self.action_feature is None:
             raise ValueError("LeWM policy requires one ACTION output feature named 'action'.")
+
+    @property
+    def selected_image_key(self) -> str:
+        image_keys = list(self.image_features.keys())
+        if len(image_keys) == 1:
+            return image_keys[0]
+        if self.preferred_image_key is None:
+            raise ValueError(
+                "Multiple visual features available but preferred_image_key is None. "
+                f"Available keys: {image_keys}"
+            )
+        if self.preferred_image_key not in image_keys:
+            raise ValueError(
+                f"preferred_image_key='{self.preferred_image_key}' not found. "
+                f"Available keys: {image_keys}"
+            )
+        return self.preferred_image_key
 
     @property
     def observation_delta_indices(self) -> list[int]:
