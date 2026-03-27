@@ -63,6 +63,7 @@ class ConvertConfig:
     report_filename: str = "conversion_report.json"
     video_backend: str | None = None
     progress_every: int = 500
+    heartbeat_seconds: float = 10.0
     num_workers: int = 0
     auto_max_workers: int = 2
     episode_batch_size: int = 16
@@ -865,10 +866,13 @@ def _convert_split(
 
         started = time.perf_counter()
         last_log = started
+        last_heartbeat = started
         rows_submitted = 0
         rows_written_pixels = 0
         row_cursor = 0
         fallback_counts: dict[str, int] = {}
+        submitted_episodes = 0
+        completed_episodes = 0
 
         mp_context = multiprocessing.get_context("spawn")
         executor: ProcessPoolExecutor | None = None
@@ -879,14 +883,31 @@ def _convert_split(
             pending: dict[Future[EpisodeWorkResult], tuple[int, int, int]] = {}
 
             def flush_ready(block_until_one: bool) -> None:
-                nonlocal rows_written_pixels, last_log
+                nonlocal rows_written_pixels, last_log, last_heartbeat, completed_episodes
                 if not pending:
                     return
                 if block_until_one:
-                    done, _ = wait(
-                        pending.keys(),
-                        return_when=FIRST_COMPLETED,
-                    )
+                    done = set()
+                    while not done:
+                        done, _ = wait(
+                            pending.keys(),
+                            return_when=FIRST_COMPLETED,
+                            timeout=cfg.heartbeat_seconds,
+                        )
+                        if done:
+                            break
+                        now = time.perf_counter()
+                        if now - last_heartbeat >= cfg.heartbeat_seconds:
+                            elapsed = now - started
+                            rate = rows_written_pixels / elapsed if elapsed > 0 else 0.0
+                            print(
+                                f"[convert][{split_name}] heartbeat: "
+                                f"episodes completed={completed_episodes}/{len(episodes)} "
+                                f"rows={rows_written_pixels}/{total_rows} "
+                                f"pending={len(pending)} rate={rate:.1f} rows/s",
+                                flush=True,
+                            )
+                            last_heartbeat = now
                 else:
                     done = list(pending.keys())
                 for fut in done:
@@ -894,8 +915,20 @@ def _convert_split(
                     result = fut.result()
                     wrote = _write_pixels_result_to_files(file_handles, result)
                     rows_written_pixels += wrote
+                    completed_episodes += 1
                     for used in result.backend_used.values():
                         fallback_counts[used] = fallback_counts.get(used, 0) + 1
+                    now = time.perf_counter()
+                    elapsed = now - started
+                    rate = rows_written_pixels / elapsed if elapsed > 0 else 0.0
+                    print(
+                        f"[convert][{split_name}] episode done ep={ep_idx} rows={wrote} "
+                        f"episodes={completed_episodes}/{len(episodes)} "
+                        f"rows={rows_written_pixels}/{total_rows} pending={len(pending)} "
+                        f"rate={rate:.1f} rows/s backends={result.backend_used}",
+                        flush=True,
+                    )
+                    last_heartbeat = now
 
                     should_log = (
                         rows_written_pixels == total_rows
@@ -964,11 +997,28 @@ def _convert_split(
                         result = process_episode_worker(item)
                         wrote = _write_pixels_result_to_files(file_handles, result)
                         rows_written_pixels += wrote
+                        completed_episodes += 1
                         for used in result.backend_used.values():
                             fallback_counts[used] = fallback_counts.get(used, 0) + 1
+                        now = time.perf_counter()
+                        elapsed = now - started
+                        rate = rows_written_pixels / elapsed if elapsed > 0 else 0.0
+                        print(
+                            f"[convert][{split_name}] episode done ep={ep_idx} rows={wrote} "
+                            f"episodes={completed_episodes}/{len(episodes)} "
+                            f"rows={rows_written_pixels}/{total_rows} rate={rate:.1f} rows/s "
+                            f"backends={result.backend_used}",
+                            flush=True,
+                        )
                     else:
                         fut = executor.submit(process_episode_worker, item)
                         pending[fut] = (int(ep_idx), row_start, row_stop)
+                        submitted_episodes += 1
+                        print(
+                            f"[convert][{split_name}] submitted ep={ep_idx} rows={ep_count} "
+                            f"submitted={submitted_episodes}/{len(episodes)} pending={len(pending)}",
+                            flush=True,
+                        )
                         if len(pending) >= max_pending:
                             flush_ready(block_until_one=True)
 
@@ -1014,6 +1064,8 @@ def main(cfg: ConvertConfig) -> None:
         raise ValueError("image_size must be > 0.")
     if cfg.progress_every < 0:
         raise ValueError("progress_every must be >= 0.")
+    if cfg.heartbeat_seconds <= 0:
+        raise ValueError("heartbeat_seconds must be > 0.")
     if cfg.auto_max_workers <= 0:
         raise ValueError("auto_max_workers must be > 0.")
     if cfg.episode_batch_size < 0:
