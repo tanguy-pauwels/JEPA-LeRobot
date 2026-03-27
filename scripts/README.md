@@ -87,3 +87,36 @@ Validation includes JEPA-critical checks:
 - no early `done=True`
 - contiguous `step_idx` from `0` to `ep_len-1`
 - consistency between `ep_len`, `ep_offset`, and per-step arrays
+
+## 4) Visualize HDF5 with Rerun
+
+Episode player (live viewer + `.rrd` saved by default):
+
+```bash
+python scripts/visualize_hdf5_rerun.py \
+  --target_path=datasets/hdf5/lerobot__koch_pick_place_1_lego/train__observation_images_front.h5 \
+  --episode_index=0
+```
+
+Resolve from a directory with split/camera filters:
+
+```bash
+python scripts/visualize_hdf5_rerun.py \
+  --target_path=datasets/hdf5/lerobot__koch_pick_place_1_lego \
+  --split=train \
+  --camera_key=observation.images.front \
+  --episode_index=3
+```
+
+Save `.rrd` without opening GUI:
+
+```bash
+python scripts/visualize_hdf5_rerun.py \
+  --target_path=datasets/hdf5/lerobot__koch_pick_place_1_lego/train__observation_images_front.h5 \
+  --episode_index=0 \
+  --spawn_viewer=false \
+  --save_rrd=true \
+  --rrd_path=artifacts/train_front_ep0.rrd
+```
+
+
