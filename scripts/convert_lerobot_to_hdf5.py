@@ -1,25 +1,23 @@
 #!/usr/bin/env python3
 """Convert LeRobot datasets (parquet+mp4) to LeWM-compatible HDF5 files."""
 
-from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
-import ctypes
-import importlib
+import importlib.util
 import json
-import multiprocessing
-import os
 from pathlib import Path
-import subprocess
 import sys
 import time
-from typing import Any
+from typing import Any, Iterator
 
 import draccus
-import h5py
 import numpy as np
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.datasets.video_utils import decode_video_frames
+
+try:
+    import h5py
+except ModuleNotFoundError:
+    h5py = None  # type: ignore[assignment]
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -34,7 +32,7 @@ from lewm_dataset_utils import (  # noqa: E402
 DEFAULT_DATASET = "lerobot/koch_pick_place_1_lego"
 VALID_DIRTY_POLICY = ("fail", "drop", "warn")
 VALID_COMPRESSION = ("none", "lzf", "gzip")
-VALID_MEMORY_GUARD_MODE = ("off", "warn", "error")
+VALID_DECODE_BACKEND = ("pyav", "opencv")
 TABULAR_COLUMNS = [
     "action",
     "observation.state",
@@ -61,10 +59,17 @@ class ConvertConfig:
     require_terminal_done: bool = True
     dirty_episode_policy: str = "fail"
     report_filename: str = "conversion_report.json"
-    video_backend: str | None = None
+
+    decode_backend: str = "pyav"
+    micro_batch_size: int = 64
+    stall_timeout_seconds: float = 120.0
+
     progress_every: int = 500
     heartbeat_seconds: float = 10.0
-    num_workers: int = 0
+
+    # Legacy options kept for CLI compatibility (deprecated).
+    num_workers: int = 1
+    video_backend: str | None = None
     auto_max_workers: int = 2
     episode_batch_size: int = 16
     max_pending_tasks: int = 0
@@ -72,29 +77,6 @@ class ConvertConfig:
     max_inflight_memory_ratio: float = 0.40
     worker_memory_buffer_mb: int = 256
     auto_install_torch: bool = True
-
-
-@dataclass
-class EpisodeWorkItem:
-    episode_index: int
-    row_start: int
-    row_stop: int
-    camera_keys: list[str]
-    video_paths: dict[str, str]
-    from_timestamps_s: dict[str, float]
-    timestamps_s: np.ndarray
-    image_size: int | None
-    preferred_backend: str | None
-    tolerance_s: float
-
-
-@dataclass
-class EpisodeWorkResult:
-    episode_index: int
-    row_start: int
-    row_stop: int
-    pixels_by_camera: dict[str, np.ndarray]
-    backend_used: dict[str, str]
 
 
 def _split_episodes(meta: Any, split_name: str) -> list[int]:
@@ -178,35 +160,6 @@ def _get_compression(compression: str) -> str | None:
 def _write_report(report_path: Path, payload: dict[str, Any]) -> None:
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-
-
-def _prevalidate_source_split(
-    repo_id: str,
-    root: Path,
-    episodes: list[int],
-    require_terminal_done: bool,
-) -> dict[int, list[str]]:
-    source_dataset = LeRobotDataset(
-        repo_id=repo_id,
-        root=root,
-        episodes=episodes,
-        download_videos=False,
-    )
-    tiny = _select_columns_compat(
-        source_dataset, ["episode_index", "frame_index", "next.done"]
-    )
-    episode_idx = _column_to_numpy(tiny, "episode_index")
-    step_idx = _column_to_numpy(tiny, "frame_index")
-    done = _column_to_numpy(tiny, "next.done")
-
-    return collect_source_episode_issues(
-        episode_idx=episode_idx,
-        step_idx=step_idx,
-        done=done,
-        require_terminal_done=require_terminal_done,
-        require_no_early_done=True,
-        require_contiguous_steps=True,
-    )
 
 
 def _slice_column_values(dataset_obj: Any, key: str, row_start: int, row_stop: int) -> Any:
@@ -297,394 +250,8 @@ def _read_episode_tabular_slice(
     }
 
 
-def _nearest_indices(frame_ts_s: np.ndarray, query_ts_s: np.ndarray) -> np.ndarray:
-    if frame_ts_s.ndim != 1 or len(frame_ts_s) == 0:
-        raise ValueError("frame_ts_s must be a non-empty 1D array.")
-    ts = frame_ts_s.astype(np.float64, copy=False)
-    q = query_ts_s.astype(np.float64, copy=False)
-    ts = np.maximum.accumulate(ts)
-    idx = np.searchsorted(ts, q, side="left")
-    idx = np.clip(idx, 0, len(ts) - 1)
-    prev_idx = np.clip(idx - 1, 0, len(ts) - 1)
-    pick_prev = np.abs(q - ts[prev_idx]) <= np.abs(ts[idx] - q)
-    idx[pick_prev] = prev_idx[pick_prev]
-    return idx.astype(np.int64, copy=False)
-
-
-def _indices_from_fps(
-    query_ts_s: np.ndarray, fps: float, frame_count: int
-) -> np.ndarray:
-    if frame_count <= 0:
-        raise ValueError("frame_count must be > 0.")
-    if fps <= 0:
-        raise ValueError("fps must be > 0.")
-    idx = np.rint(query_ts_s.astype(np.float64) * fps).astype(np.int64)
-    return np.clip(idx, 0, frame_count - 1)
-
-
-def _normalize_decoded_frames(frames: np.ndarray) -> np.ndarray:
-    if frames.ndim != 4:
-        raise RuntimeError(f"Decoded frames have unexpected shape: {frames.shape}")
-    if frames.shape[-1] in (1, 3):
-        out = frames
-    elif frames.shape[1] in (1, 3):
-        out = np.transpose(frames, (0, 2, 3, 1))
-    else:
-        raise RuntimeError(f"Unexpected channel layout in decoded frames: {frames.shape}")
-
-    if out.dtype != np.uint8:
-        if np.issubdtype(out.dtype, np.floating):
-            out = (out * 255.0).clip(0, 255).astype(np.uint8)
-        else:
-            out = out.clip(0, 255).astype(np.uint8)
-    return out
-
-
-def _decode_with_decord(video_path: Path, query_ts_s: np.ndarray) -> np.ndarray:
-    import decord
-
-    vr = decord.VideoReader(str(video_path))
-    frame_count = len(vr)
-    if frame_count <= 0:
-        raise RuntimeError(f"decord returned empty video for {video_path}.")
-
-    all_idx = np.arange(frame_count, dtype=np.int64)
-    all_frames = vr.get_batch(all_idx.tolist()).asnumpy()
-    all_frames = _normalize_decoded_frames(all_frames)
-
-    frame_ts_s: np.ndarray | None = None
-    if hasattr(vr, "get_frame_timestamp"):
-        try:
-            ts = np.asarray(vr.get_frame_timestamp(all_idx.tolist()))
-            if ts.ndim == 2:
-                ts = ts[:, 0]
-            if ts.ndim == 1 and len(ts) == frame_count:
-                finite = np.isfinite(ts)
-                if finite.all():
-                    frame_ts_s = ts.astype(np.float64, copy=False)
-        except Exception:
-            frame_ts_s = None
-
-    if frame_ts_s is not None:
-        select_idx = _nearest_indices(frame_ts_s, query_ts_s)
-    else:
-        fps = float(vr.get_avg_fps()) if hasattr(vr, "get_avg_fps") else 0.0
-        if fps <= 0:
-            raise RuntimeError("decord could not infer FPS and timestamps are unavailable.")
-        select_idx = _indices_from_fps(query_ts_s, fps=fps, frame_count=frame_count)
-
-    return all_frames[select_idx]
-
-
-def _decode_with_pyav(video_path: Path, query_ts_s: np.ndarray) -> np.ndarray:
-    import av
-
-    decoded_frames: list[np.ndarray] = []
-    frame_ts_s: list[float] = []
-    with av.open(str(video_path)) as container:
-        stream = container.streams.video[0]
-        stream.thread_type = "AUTO"
-        avg_rate = float(stream.average_rate) if stream.average_rate else 0.0
-        fallback_fps = avg_rate if avg_rate > 0 else 30.0
-        for i, frame in enumerate(container.decode(stream)):
-            arr = frame.to_ndarray(format="rgb24")
-            decoded_frames.append(arr)
-            if frame.time is not None:
-                frame_ts_s.append(float(frame.time))
-            elif frame.pts is not None and stream.time_base is not None:
-                frame_ts_s.append(float(frame.pts * stream.time_base))
-            else:
-                frame_ts_s.append(i / fallback_fps)
-
-    if not decoded_frames:
-        raise RuntimeError(f"PyAV returned empty video for {video_path}.")
-
-    frames_np = np.stack(decoded_frames, axis=0)
-    frames_np = _normalize_decoded_frames(frames_np)
-    ts_np = np.asarray(frame_ts_s, dtype=np.float64)
-    select_idx = _nearest_indices(ts_np, query_ts_s)
-    return frames_np[select_idx]
-
-
-def _decode_with_lerobot_seek(
-    video_path: Path, query_ts_s: np.ndarray, tolerance_s: float, backend: str | None
-) -> np.ndarray:
-    frames = decode_video_frames(
-        video_path=video_path,
-        timestamps=query_ts_s.astype(np.float64).tolist(),
-        tolerance_s=tolerance_s,
-        backend=backend,
-    )
-    if hasattr(frames, "detach") and hasattr(frames, "cpu"):
-        frames_np = frames.detach().cpu().numpy()
-    else:
-        frames_np = np.asarray(frames)
-    return _normalize_decoded_frames(frames_np)
-
-
-def _decode_frames_linear(
-    video_path: Path,
-    query_ts_s: np.ndarray,
-    preferred_backend: str | None,
-    tolerance_s: float,
-) -> tuple[np.ndarray, str]:
-    pref = (preferred_backend or "").strip().lower()
-    if pref in ("", "auto", "default"):
-        candidates = ["decord", "pyav", "lerobot"]
-    elif pref in ("pyav", "av"):
-        candidates = ["pyav", "decord", "lerobot"]
-    elif pref == "decord":
-        candidates = ["decord", "pyav", "lerobot"]
-    else:
-        candidates = [pref, "decord", "pyav", "lerobot"]
-
-    errors: list[str] = []
-    for backend in candidates:
-        try:
-            if backend == "decord":
-                return _decode_with_decord(video_path, query_ts_s), "decord"
-            if backend in ("pyav", "av"):
-                return _decode_with_pyav(video_path, query_ts_s), "pyav"
-            return (
-                _decode_with_lerobot_seek(
-                    video_path=video_path,
-                    query_ts_s=query_ts_s,
-                    tolerance_s=tolerance_s,
-                    backend=preferred_backend,
-                ),
-                "lerobot_seek",
-            )
-        except Exception as exc:
-            errors.append(f"{backend}: {exc}")
-    raise RuntimeError(
-        f"Unable to decode {video_path} with backends {candidates}. Errors={errors}"
-    )
-
-
-def _ensure_torch_installed(auto_install: bool) -> None:
-    try:
-        import torch  # noqa: F401
-        return
-    except ModuleNotFoundError:
-        if not auto_install:
-            raise
-
-    cmd = [sys.executable, "-m", "pip", "install", "torch"]
-    proc = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        check=False,
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(
-            "Torch is required for fast resize and automatic installation failed. "
-            f"Command={' '.join(cmd)}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
-        )
-    importlib.invalidate_caches()
-    import torch  # noqa: F401
-
-
-def _resize_frames_fast(frames_hwc_uint8: np.ndarray, image_size: int | None) -> np.ndarray:
-    if image_size is None:
-        return frames_hwc_uint8
-    if frames_hwc_uint8.shape[1] == image_size and frames_hwc_uint8.shape[2] == image_size:
-        return frames_hwc_uint8
-
-    import torch
-    import torch.nn.functional as F
-
-    device = "cpu"
-    if torch.cuda.is_available():
-        device = "cuda"
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        device = "mps"
-
-    tensor = (
-        torch.from_numpy(frames_hwc_uint8)
-        .permute(0, 3, 1, 2)
-        .contiguous()
-        .to(device=device, dtype=torch.float32)
-    )
-    tensor = tensor / 255.0
-    with torch.inference_mode():
-        try:
-            resized = F.interpolate(
-                tensor,
-                size=(image_size, image_size),
-                mode="bilinear",
-                align_corners=False,
-                antialias=True,
-            )
-        except TypeError:
-            resized = F.interpolate(
-                tensor,
-                size=(image_size, image_size),
-                mode="bilinear",
-                align_corners=False,
-            )
-
-    out = (
-        (resized.clamp(0, 1) * 255.0)
-        .round()
-        .to(torch.uint8)
-        .permute(0, 2, 3, 1)
-        .contiguous()
-        .cpu()
-        .numpy()
-    )
-    return out
-
-
-def process_episode_worker(task: EpisodeWorkItem) -> EpisodeWorkResult:
-    row_count = task.row_stop - task.row_start
-    if row_count <= 0:
-        raise ValueError(f"Invalid row slice [{task.row_start}, {task.row_stop}).")
-    if len(task.timestamps_s) != row_count:
-        raise ValueError(
-            f"timestamps size mismatch for episode {task.episode_index}: "
-            f"{len(task.timestamps_s)} vs row_count={row_count}"
-        )
-
-    pixels_by_camera: dict[str, np.ndarray] = {}
-    backend_used: dict[str, str] = {}
-    timestamps = task.timestamps_s.astype(np.float64, copy=False)
-    for camera in task.camera_keys:
-        video_path = Path(task.video_paths[camera])
-        query_ts_s = timestamps + float(task.from_timestamps_s[camera])
-        frames_np, used = _decode_frames_linear(
-            video_path=video_path,
-            query_ts_s=query_ts_s,
-            preferred_backend=task.preferred_backend,
-            tolerance_s=task.tolerance_s,
-        )
-        frames_np = _resize_frames_fast(frames_np, task.image_size)
-        if frames_np.shape[0] != row_count:
-            raise RuntimeError(
-                f"Decoded row count mismatch for ep={task.episode_index}, "
-                f"cam={camera}: got={frames_np.shape[0]} expected={row_count}"
-            )
-        pixels_by_camera[camera] = frames_np
-        backend_used[camera] = used
-
-    return EpisodeWorkResult(
-        episode_index=task.episode_index,
-        row_start=task.row_start,
-        row_stop=task.row_stop,
-        pixels_by_camera=pixels_by_camera,
-        backend_used=backend_used,
-    )
-
-
-def _compute_chunk_rows(total_rows: int, pixel_shape: tuple[int, int, int]) -> int:
-    bytes_per_row = int(np.prod(np.asarray(pixel_shape, dtype=np.int64)))
-    target_bytes = 8 * 1024 * 1024
-    if bytes_per_row <= 0:
-        return 1
-    chunk_rows = target_bytes // bytes_per_row
-    chunk_rows = max(1, min(int(chunk_rows), total_rows))
-    return chunk_rows
-
-
-def _get_available_memory_bytes() -> int | None:
-    try:
-        pages = os.sysconf("SC_AVPHYS_PAGES")
-        page_size = os.sysconf("SC_PAGE_SIZE")
-        if isinstance(pages, int) and isinstance(page_size, int) and pages > 0 and page_size > 0:
-            return int(pages * page_size)
-    except Exception:
-        pass
-
-    if os.name == "nt":
-        try:
-            class MEMORYSTATUSEX(ctypes.Structure):
-                _fields_ = [
-                    ("dwLength", ctypes.c_ulong),
-                    ("dwMemoryLoad", ctypes.c_ulong),
-                    ("ullTotalPhys", ctypes.c_ulonglong),
-                    ("ullAvailPhys", ctypes.c_ulonglong),
-                    ("ullTotalPageFile", ctypes.c_ulonglong),
-                    ("ullAvailPageFile", ctypes.c_ulonglong),
-                    ("ullTotalVirtual", ctypes.c_ulonglong),
-                    ("ullAvailVirtual", ctypes.c_ulonglong),
-                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
-                ]
-
-            mem_status = MEMORYSTATUSEX()
-            mem_status.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
-            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(mem_status)):
-                return int(mem_status.ullAvailPhys)
-        except Exception:
-            return None
-    return None
-
-
-def _resolve_num_workers(cfg: ConvertConfig, episode_count: int) -> int:
-    if episode_count <= 1:
-        return 1
-    if cfg.num_workers > 0:
-        return min(cfg.num_workers, episode_count)
-    cpu = os.cpu_count() or 1
-    auto_cap = max(1, cfg.auto_max_workers)
-    return max(1, min(episode_count, cpu - 1, auto_cap))
-
-
-def _maybe_guard_memory_risk(
-    cfg: ConvertConfig,
-    split_name: str,
-    ep_len: np.ndarray,
-    pixel_shape: tuple[int, int, int],
-    camera_count: int,
-    max_workers: int,
-    max_pending: int,
-) -> None:
-    if cfg.memory_guard_mode == "off":
-        return
-    if len(ep_len) == 0:
-        return
-
-    p75_rows = int(np.percentile(ep_len, 75))
-    p75_rows = max(1, p75_rows)
-    bytes_per_row_pixels = int(np.prod(np.asarray(pixel_shape, dtype=np.int64))) * camera_count
-    episode_pixels_bytes = p75_rows * bytes_per_row_pixels
-
-    # Rough upper bound: results in flight + worker decode buffers + process overhead.
-    est_inflight_bytes = episode_pixels_bytes * max(1, max_pending)
-    est_worker_bytes = episode_pixels_bytes * max(1, max_workers) * 2
-    est_proc_overhead = max(1, max_workers) * int(cfg.worker_memory_buffer_mb) * 1024 * 1024
-    estimated_bytes = est_inflight_bytes + est_worker_bytes + est_proc_overhead
-
-    available = _get_available_memory_bytes()
-    if available is None or available <= 0:
-        print(
-            f"[convert][{split_name}][warn] cannot estimate available RAM; "
-            f"memory guard skipped. workers={max_workers} pending={max_pending}",
-            flush=True,
-        )
-        return
-
-    ratio = estimated_bytes / float(available)
-    msg = (
-        f"[convert][{split_name}] memory_guard estimate: p75_episode_rows={p75_rows}, "
-        f"est_peak={estimated_bytes / (1024**3):.2f}GiB, "
-        f"available={available / (1024**3):.2f}GiB, ratio={ratio:.2f}, "
-        f"threshold={cfg.max_inflight_memory_ratio:.2f}, workers={max_workers}, pending={max_pending}"
-    )
-    if ratio >= cfg.max_inflight_memory_ratio:
-        if cfg.memory_guard_mode == "error":
-            raise MemoryError(
-                msg
-                + ". Refuse to start conversion. Lower --num_workers/--max_pending_tasks "
-                "or raise --max_inflight_memory_ratio."
-            )
-        print(f"{msg} [warning: high OOM risk]", flush=True)
-    elif ratio >= cfg.max_inflight_memory_ratio * 0.75:
-        print(f"{msg} [warning: elevated memory pressure]", flush=True)
-
-
 def _write_tabular_slice_to_all_files(
-    camera_files: dict[str, h5py.File], row_slice: slice, tabular: dict[str, np.ndarray]
+    camera_files: dict[str, Any], row_slice: slice, tabular: dict[str, np.ndarray]
 ) -> None:
     for h5f in camera_files.values():
         h5f["action"][row_slice] = tabular["action"]
@@ -698,19 +265,379 @@ def _write_tabular_slice_to_all_files(
         h5f["task_index"][row_slice] = tabular["task_index"]
 
 
-def _write_pixels_result_to_files(
-    camera_files: dict[str, h5py.File], result: EpisodeWorkResult
-) -> int:
-    row_slice = slice(result.row_start, result.row_stop)
-    row_count = result.row_stop - result.row_start
-    for camera, frames in result.pixels_by_camera.items():
-        if frames.shape[0] != row_count:
-            raise RuntimeError(
-                f"Worker returned invalid frame count for camera={camera}. "
-                f"got={frames.shape[0]} expected={row_count}"
+def _require_h5py() -> None:
+    if h5py is None:
+        raise RuntimeError(
+            "Missing dependency 'h5py'. Install with: pip install h5py"
+        )
+
+
+def _require_pyav() -> Any:
+    if importlib.util.find_spec("av") is None:
+        raise RuntimeError("Missing dependency 'av'. Install with: pip install av")
+    import av
+
+    return av
+
+
+def _require_cv2() -> Any:
+    if importlib.util.find_spec("cv2") is None:
+        raise RuntimeError(
+            "Missing dependency 'opencv-python'. Install with: pip install opencv-python"
+        )
+    import cv2
+
+    return cv2
+
+
+def _assert_runtime_dependencies() -> None:
+    _require_h5py()
+    _require_pyav()
+    _require_cv2()
+
+
+def _normalize_frame_hwc_uint8(frame: np.ndarray) -> np.ndarray:
+    arr = np.asarray(frame)
+    if arr.ndim == 2:
+        arr = arr[:, :, None]
+    if arr.ndim != 3:
+        raise ValueError(f"Expected frame with 3 dims, got shape={arr.shape}.")
+
+    if arr.shape[0] in (1, 3) and arr.shape[-1] not in (1, 3):
+        arr = np.transpose(arr, (1, 2, 0))
+
+    if arr.dtype != np.uint8:
+        if np.issubdtype(arr.dtype, np.floating):
+            if arr.max(initial=0) <= 1.0:
+                arr = (arr * 255.0).clip(0, 255).astype(np.uint8)
+            else:
+                arr = arr.clip(0, 255).astype(np.uint8)
+        else:
+            arr = arr.clip(0, 255).astype(np.uint8)
+
+    if arr.ndim != 3 or arr.shape[-1] not in (1, 3):
+        raise ValueError(f"Frame must be HWC with C=1/3. Got {arr.shape}.")
+    return np.ascontiguousarray(arr)
+
+
+def _resize_batch_cv2(frames: list[np.ndarray], image_size: int | None) -> np.ndarray:
+    if not frames:
+        raise ValueError("Cannot resize an empty batch.")
+
+    if image_size is None:
+        out = [_normalize_frame_hwc_uint8(f) for f in frames]
+        return np.stack(out, axis=0)
+
+    cv2 = _require_cv2()
+    resized: list[np.ndarray] = []
+    for frame in frames:
+        arr = _normalize_frame_hwc_uint8(frame)
+        resized_frame = cv2.resize(
+            arr,
+            (image_size, image_size),
+            interpolation=cv2.INTER_LINEAR,
+        )
+        if resized_frame.ndim == 2:
+            resized_frame = resized_frame[:, :, None]
+        resized.append(_normalize_frame_hwc_uint8(resized_frame))
+    return np.stack(resized, axis=0)
+
+
+def _iter_frames_pyav(video_path: Path) -> Iterator[np.ndarray]:
+    av = _require_pyav()
+    container = av.open(str(video_path))
+    try:
+        stream = container.streams.video[0]
+        stream.thread_type = "AUTO"
+        for frame in container.decode(stream):
+            yield frame.to_ndarray(format="rgb24")
+    finally:
+        container.close()
+
+
+def _iter_frames_opencv(video_path: Path) -> Iterator[np.ndarray]:
+    cv2 = _require_cv2()
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        cap.release()
+        raise RuntimeError(f"OpenCV could not open video: {video_path}")
+
+    try:
+        while True:
+            ok, bgr = cap.read()
+            if not ok:
+                break
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            yield rgb
+    finally:
+        cap.release()
+
+
+def _backend_order(decode_backend: str) -> list[str]:
+    if decode_backend == "pyav":
+        return ["pyav", "opencv"]
+    return ["opencv", "pyav"]
+
+
+def _open_linear_frame_iterator(
+    video_path: Path,
+    decode_backend: str,
+) -> tuple[str, Iterator[np.ndarray], np.ndarray]:
+    errors: list[str] = []
+    for backend in _backend_order(decode_backend):
+        frame_iter: Iterator[np.ndarray] | None = None
+        opened = False
+        try:
+            if backend == "pyav":
+                frame_iter = _iter_frames_pyav(video_path)
+            else:
+                frame_iter = _iter_frames_opencv(video_path)
+            first = next(frame_iter)
+            opened = True
+            return backend, frame_iter, _normalize_frame_hwc_uint8(first)
+        except StopIteration:
+            errors.append(f"{backend}: empty stream")
+        except Exception as exc:
+            errors.append(f"{backend}: {exc}")
+        finally:
+            if frame_iter is not None and not opened:
+                close_fn = getattr(frame_iter, "close", None)
+                if callable(close_fn):
+                    close_fn()
+
+    raise RuntimeError(
+        f"Unable to open {video_path} with backends {_backend_order(decode_backend)}. "
+        f"Errors={errors}"
+    )
+
+
+def _check_stall_or_raise(
+    *,
+    now: float,
+    last_progress: float,
+    stall_timeout_seconds: float,
+    context: str,
+) -> None:
+    if now - last_progress > stall_timeout_seconds:
+        raise TimeoutError(
+            f"Stall watchdog triggered ({stall_timeout_seconds:.1f}s without progress). "
+            f"Context={context}"
+        )
+
+
+def _assert_frame_count_or_raise(
+    *,
+    decoded_frames: int,
+    expected_frames: int,
+    split_name: str,
+    episode_index: int,
+    camera_key: str,
+) -> None:
+    if decoded_frames != expected_frames:
+        raise RuntimeError(
+            f"Frame count mismatch on split={split_name}, episode={episode_index}, "
+            f"camera={camera_key}. decoded={decoded_frames}, expected={expected_frames}."
+        )
+
+
+def _compute_chunk_rows(total_rows: int, micro_batch_size: int) -> int:
+    return max(1, min(total_rows, micro_batch_size))
+
+
+def _estimate_micro_batch_ram_mb(
+    micro_batch_size: int,
+    pixel_shape: tuple[int, int, int],
+    camera_count: int,
+) -> float:
+    bytes_per_frame_all_cams = int(np.prod(np.asarray(pixel_shape, dtype=np.int64))) * camera_count
+    return (bytes_per_frame_all_cams * micro_batch_size) / (1024.0 * 1024.0)
+
+
+def _resolve_decode_backend(cfg: ConvertConfig) -> str:
+    backend = cfg.decode_backend.strip().lower()
+    if cfg.video_backend:
+        legacy = cfg.video_backend.strip().lower()
+        if legacy in ("pyav", "av") and cfg.decode_backend == "pyav":
+            print(
+                "[convert][warn] --video_backend is deprecated; mapped to --decode_backend=pyav.",
+                flush=True,
             )
-        camera_files[camera]["pixels"][row_slice] = frames
-    return row_count
+            backend = "pyav"
+        elif legacy in ("opencv", "cv2") and cfg.decode_backend == "pyav":
+            print(
+                "[convert][warn] --video_backend is deprecated; mapped to --decode_backend=opencv.",
+                flush=True,
+            )
+            backend = "opencv"
+        else:
+            print(
+                "[convert][warn] --video_backend is deprecated and ignored by the new linear pipeline.",
+                flush=True,
+            )
+    return backend
+
+
+def _warn_deprecated_options(cfg: ConvertConfig) -> None:
+    if cfg.num_workers != 1:
+        print(
+            f"[convert][warn] --num_workers={cfg.num_workers} is deprecated in stable mode; forcing 1.",
+            flush=True,
+        )
+    if cfg.auto_max_workers != 2:
+        print("[convert][warn] --auto_max_workers is deprecated and ignored.", flush=True)
+    if cfg.episode_batch_size != 16:
+        print("[convert][warn] --episode_batch_size is deprecated and ignored.", flush=True)
+    if cfg.max_pending_tasks != 0:
+        print("[convert][warn] --max_pending_tasks is deprecated and ignored.", flush=True)
+    if cfg.memory_guard_mode != "warn":
+        print("[convert][warn] --memory_guard_mode is deprecated and ignored.", flush=True)
+    if cfg.max_inflight_memory_ratio != 0.40:
+        print("[convert][warn] --max_inflight_memory_ratio is deprecated and ignored.", flush=True)
+    if cfg.worker_memory_buffer_mb != 256:
+        print("[convert][warn] --worker_memory_buffer_mb is deprecated and ignored.", flush=True)
+    if cfg.auto_install_torch is not True:
+        print("[convert][warn] --auto_install_torch is deprecated and ignored.", flush=True)
+
+
+def _prevalidate_source_split(
+    repo_id: str,
+    root: Path,
+    episodes: list[int],
+    require_terminal_done: bool,
+) -> dict[int, list[str]]:
+    source_dataset = LeRobotDataset(
+        repo_id=repo_id,
+        root=root,
+        episodes=episodes,
+        download_videos=False,
+    )
+    tiny = _select_columns_compat(
+        source_dataset, ["episode_index", "frame_index", "next.done"]
+    )
+    episode_idx = _column_to_numpy(tiny, "episode_index")
+    step_idx = _column_to_numpy(tiny, "frame_index")
+    done = _column_to_numpy(tiny, "next.done")
+
+    return collect_source_episode_issues(
+        episode_idx=episode_idx,
+        step_idx=step_idx,
+        done=done,
+        require_terminal_done=require_terminal_done,
+        require_no_early_done=True,
+        require_contiguous_steps=True,
+    )
+
+
+def _decode_and_write_episode_camera(
+    *,
+    split_name: str,
+    episode_index: int,
+    camera: str,
+    video_path: Path,
+    pixels_ds: Any,
+    row_start: int,
+    row_stop: int,
+    expected_rows: int,
+    image_size: int | None,
+    micro_batch_size: int,
+    decode_backend: str,
+    stall_timeout_seconds: float,
+    heartbeat_seconds: float,
+) -> tuple[str, int, int]:
+    if expected_rows <= 0:
+        return "none", 0, 0
+
+    backend_used, frame_iter, first_frame = _open_linear_frame_iterator(
+        video_path=video_path,
+        decode_backend=decode_backend,
+    )
+
+    write_cursor = row_start
+    decoded_frames = 1
+    flush_count = 0
+    buffer: list[np.ndarray] = [first_frame]
+
+    now = time.perf_counter()
+    last_progress = now
+    last_heartbeat = now
+
+    context = f"split={split_name} ep={episode_index} cam={camera}"
+
+    try:
+        while decoded_frames < expected_rows:
+            now = time.perf_counter()
+            _check_stall_or_raise(
+                now=now,
+                last_progress=last_progress,
+                stall_timeout_seconds=stall_timeout_seconds,
+                context=context,
+            )
+            try:
+                frame = next(frame_iter)
+            except StopIteration as exc:
+                raise RuntimeError(
+                    f"Video ended early ({context}). decoded={decoded_frames}, expected={expected_rows}"
+                ) from exc
+
+            buffer.append(frame)
+            decoded_frames += 1
+            last_progress = now
+
+            if len(buffer) >= micro_batch_size:
+                batch = _resize_batch_cv2(buffer, image_size)
+                n = int(batch.shape[0])
+                pixels_ds[write_cursor : write_cursor + n] = batch
+                write_cursor += n
+                flush_count += 1
+                print(
+                    f"[convert][{split_name}] flush ep={episode_index} cam={camera} "
+                    f"batch={flush_count} rows={n} written={write_cursor - row_start}/{expected_rows}",
+                    flush=True,
+                )
+                buffer.clear()
+                last_progress = time.perf_counter()
+
+            now = time.perf_counter()
+            if now - last_heartbeat >= heartbeat_seconds:
+                print(
+                    f"[convert][{split_name}] heartbeat ep={episode_index} cam={camera} "
+                    f"decoded={decoded_frames}/{expected_rows} "
+                    f"written={write_cursor - row_start}/{expected_rows}",
+                    flush=True,
+                )
+                last_heartbeat = now
+
+        if buffer:
+            batch = _resize_batch_cv2(buffer, image_size)
+            n = int(batch.shape[0])
+            pixels_ds[write_cursor : write_cursor + n] = batch
+            write_cursor += n
+            flush_count += 1
+            print(
+                f"[convert][{split_name}] flush ep={episode_index} cam={camera} "
+                f"batch={flush_count} rows={n} written={write_cursor - row_start}/{expected_rows} (final)",
+                flush=True,
+            )
+            buffer.clear()
+            last_progress = time.perf_counter()
+
+        _assert_frame_count_or_raise(
+            decoded_frames=decoded_frames,
+            expected_frames=expected_rows,
+            split_name=split_name,
+            episode_index=episode_index,
+            camera_key=camera,
+        )
+        if write_cursor != row_stop:
+            raise RuntimeError(
+                f"Write cursor mismatch ({context}). write_cursor={write_cursor} row_stop={row_stop}"
+            )
+
+        return backend_used, decoded_frames, flush_count
+    finally:
+        close_fn = getattr(frame_iter, "close", None)
+        if callable(close_fn):
+            close_fn()
 
 
 def _convert_split(
@@ -720,6 +647,7 @@ def _convert_split(
     root: Path,
     output_dir: Path,
     camera_keys: list[str],
+    decode_backend: str,
 ) -> list[str]:
     print(
         f"[convert][{split_name}] loading tabular columns "
@@ -731,7 +659,6 @@ def _convert_split(
         root=root,
         episodes=episodes,
         download_videos=False,
-        video_backend=cfg.video_backend,
     )
     if len(ds) == 0:
         raise RuntimeError(f"Split '{split_name}' contains zero frames after filtering.")
@@ -755,17 +682,23 @@ def _convert_split(
         image_hw = (cfg.image_size, cfg.image_size)
     pixel_shape = (image_hw[0], image_hw[1], channels)
 
+    batch_ram_mb = _estimate_micro_batch_ram_mb(
+        micro_batch_size=cfg.micro_batch_size,
+        pixel_shape=pixel_shape,
+        camera_count=len(camera_keys),
+    )
     print(
-        f"[convert][{split_name}] total_rows={total_rows}, "
-        f"fps={int(ds.meta.fps)}, image_size={cfg.image_size or 'native'}",
+        f"[convert][{split_name}] total_rows={total_rows}, fps={int(ds.meta.fps)}, "
+        f"image_size={cfg.image_size or 'native'}, micro_batch={cfg.micro_batch_size}, "
+        f"decode_backend={decode_backend}, est_batch_ram={batch_ram_mb:.1f}MB",
         flush=True,
     )
 
-    file_handles: dict[str, h5py.File] = {}
+    file_handles: dict[str, Any] = {}
     produced_files: list[str] = []
     try:
         compression = _get_compression(cfg.compression)
-        chunk_rows = _compute_chunk_rows(total_rows=total_rows, pixel_shape=pixel_shape)
+        chunk_rows = _compute_chunk_rows(total_rows=total_rows, micro_batch_size=cfg.micro_batch_size)
         pixel_chunks = (chunk_rows,) + pixel_shape
         scalar_chunks = (chunk_rows,)
 
@@ -783,7 +716,7 @@ def _convert_split(
                 )
             out_path.parent.mkdir(parents=True, exist_ok=True)
 
-            h5f = h5py.File(out_path, "w")
+            h5f = h5py.File(out_path, "w")  # type: ignore[union-attr]
             file_handles[camera] = h5f
             produced_files.append(str(out_path))
 
@@ -830,215 +763,92 @@ def _convert_split(
             h5f.attrs["fps"] = int(ds.meta.fps)
             h5f.attrs["generated_by"] = "convert_lerobot_to_hdf5.py"
 
-        episode_batch_size = (
-            cfg.episode_batch_size if cfg.episode_batch_size > 0 else len(episodes)
-        )
-        max_workers = _resolve_num_workers(cfg, len(episodes))
-        max_pending = (
-            cfg.max_pending_tasks
-            if cfg.max_pending_tasks > 0
-            else max(1, min(max_workers, 2))
-        )
-        use_pool = max_workers > 1
-        tolerance_s = float(getattr(ds, "tolerance_s", 1e-4))
+        started = time.perf_counter()
+        last_log = started
+        cursor = 0
+        rows_written = 0
+        backend_counts: dict[str, int] = {}
 
-        _maybe_guard_memory_risk(
-            cfg=cfg,
-            split_name=split_name,
-            ep_len=ep_len,
-            pixel_shape=pixel_shape,
-            camera_count=len(camera_keys),
-            max_workers=max_workers,
-            max_pending=max_pending,
-        )
-        if sys.platform == "darwin" and max_workers > 4:
+        for ep_pos, ep_idx in enumerate(episodes):
+            ep_count = int(ep_len[ep_pos])
+            row_start = cursor
+            row_stop = cursor + ep_count
+            row_slice = slice(row_start, row_stop)
+
+            ep_started = time.perf_counter()
             print(
-                f"[convert][{split_name}][warn] workers={max_workers} on macOS may cause "
-                "instability with video decode backends. Prefer <=4 unless benchmarked.",
+                f"[convert][{split_name}] episode start ep={ep_idx} rows={ep_count} "
+                f"({ep_pos + 1}/{len(episodes)})",
                 flush=True,
             )
 
-        print(
-            f"[convert][{split_name}] workers={max_workers} spawn={'yes' if use_pool else 'no'} "
-            f"episode_batch_size={episode_batch_size} max_pending={max_pending}",
-            flush=True,
-        )
+            tabular = _read_episode_tabular_slice(cols, row_start, row_stop)
+            _write_tabular_slice_to_all_files(file_handles, row_slice, tabular)
 
-        started = time.perf_counter()
-        last_log = started
-        last_heartbeat = started
-        rows_submitted = 0
-        rows_written_pixels = 0
-        row_cursor = 0
-        fallback_counts: dict[str, int] = {}
-        submitted_episodes = 0
-        completed_episodes = 0
-
-        mp_context = multiprocessing.get_context("spawn")
-        executor: ProcessPoolExecutor | None = None
-        if use_pool:
-            executor = ProcessPoolExecutor(max_workers=max_workers, mp_context=mp_context)
-
-        try:
-            pending: dict[Future[EpisodeWorkResult], tuple[int, int, int]] = {}
-
-            def flush_ready(block_until_one: bool) -> None:
-                nonlocal rows_written_pixels, last_log, last_heartbeat, completed_episodes
-                if not pending:
-                    return
-                if block_until_one:
-                    done = set()
-                    while not done:
-                        done, _ = wait(
-                            pending.keys(),
-                            return_when=FIRST_COMPLETED,
-                            timeout=cfg.heartbeat_seconds,
-                        )
-                        if done:
-                            break
-                        now = time.perf_counter()
-                        if now - last_heartbeat >= cfg.heartbeat_seconds:
-                            elapsed = now - started
-                            rate = rows_written_pixels / elapsed if elapsed > 0 else 0.0
-                            print(
-                                f"[convert][{split_name}] heartbeat: "
-                                f"episodes completed={completed_episodes}/{len(episodes)} "
-                                f"rows={rows_written_pixels}/{total_rows} "
-                                f"pending={len(pending)} rate={rate:.1f} rows/s",
-                                flush=True,
-                            )
-                            last_heartbeat = now
-                else:
-                    done = list(pending.keys())
-                for fut in done:
-                    ep_idx, row_start, row_stop = pending.pop(fut)
-                    result = fut.result()
-                    wrote = _write_pixels_result_to_files(file_handles, result)
-                    rows_written_pixels += wrote
-                    completed_episodes += 1
-                    for used in result.backend_used.values():
-                        fallback_counts[used] = fallback_counts.get(used, 0) + 1
-                    now = time.perf_counter()
-                    elapsed = now - started
-                    rate = rows_written_pixels / elapsed if elapsed > 0 else 0.0
-                    print(
-                        f"[convert][{split_name}] episode done ep={ep_idx} rows={wrote} "
-                        f"episodes={completed_episodes}/{len(episodes)} "
-                        f"rows={rows_written_pixels}/{total_rows} pending={len(pending)} "
-                        f"rate={rate:.1f} rows/s backends={result.backend_used}",
-                        flush=True,
-                    )
-                    last_heartbeat = now
-
-                    should_log = (
-                        rows_written_pixels == total_rows
-                        or (
-                            cfg.progress_every > 0
-                            and rows_written_pixels % cfg.progress_every == 0
-                            and (time.perf_counter() - last_log) > 0.5
-                        )
-                    )
-                    if should_log:
-                        now = time.perf_counter()
-                        elapsed = now - started
-                        rate = rows_written_pixels / elapsed if elapsed > 0 else 0.0
-                        remaining = total_rows - rows_written_pixels
-                        eta = remaining / rate if rate > 0 else float("inf")
-                        pct = (100.0 * rows_written_pixels) / total_rows
-                        print(
-                            f"[convert][{split_name}] {rows_written_pixels}/{total_rows} "
-                            f"({pct:.1f}%) rate={rate:.1f} rows/s eta={eta:.1f}s",
-                            flush=True,
-                        )
-                        last_log = now
-
-            for batch_start in range(0, len(episodes), episode_batch_size):
-                batch_end = min(len(episodes), batch_start + episode_batch_size)
-                batch_eps = episodes[batch_start:batch_end]
+            for camera in camera_keys:
+                video_path = root / ds.meta.get_video_file_path(ep_idx, camera)
+                backend_used, decoded, flushes = _decode_and_write_episode_camera(
+                    split_name=split_name,
+                    episode_index=int(ep_idx),
+                    camera=camera,
+                    video_path=video_path,
+                    pixels_ds=file_handles[camera]["pixels"],
+                    row_start=row_start,
+                    row_stop=row_stop,
+                    expected_rows=ep_count,
+                    image_size=cfg.image_size,
+                    micro_batch_size=cfg.micro_batch_size,
+                    decode_backend=decode_backend,
+                    stall_timeout_seconds=cfg.stall_timeout_seconds,
+                    heartbeat_seconds=cfg.heartbeat_seconds,
+                )
+                backend_counts[backend_used] = backend_counts.get(backend_used, 0) + 1
                 print(
-                    f"[convert][{split_name}] submitting batch "
-                    f"{batch_start}:{batch_end} ({len(batch_eps)} episodes)",
+                    f"[convert][{split_name}] episode camera done ep={ep_idx} cam={camera} "
+                    f"decoded={decoded} backend={backend_used} flushes={flushes}",
                     flush=True,
                 )
-                for local_pos, ep_idx in enumerate(batch_eps):
-                    ep_global_pos = batch_start + local_pos
-                    ep_count = int(ep_len[ep_global_pos])
-                    row_start = row_cursor
-                    row_stop = row_cursor + ep_count
-                    row_slice = slice(row_start, row_stop)
-                    row_cursor = row_stop
 
-                    tabular = _read_episode_tabular_slice(cols, row_start, row_stop)
-                    _write_tabular_slice_to_all_files(file_handles, row_slice, tabular)
+            cursor = row_stop
+            rows_written = cursor
 
-                    ep_row = _get_episode_row(ds.meta.episodes, ep_idx)
-                    video_paths = {
-                        camera: str(root / ds.meta.get_video_file_path(ep_idx, camera))
-                        for camera in camera_keys
-                    }
-                    from_ts = {
-                        camera: float(ep_row[f"videos/{camera}/from_timestamp"])
-                        for camera in camera_keys
-                    }
-                    item = EpisodeWorkItem(
-                        episode_index=int(ep_idx),
-                        row_start=row_start,
-                        row_stop=row_stop,
-                        camera_keys=list(camera_keys),
-                        video_paths=video_paths,
-                        from_timestamps_s=from_ts,
-                        timestamps_s=tabular["timestamp"].astype(np.float64, copy=False),
-                        image_size=cfg.image_size,
-                        preferred_backend=cfg.video_backend,
-                        tolerance_s=tolerance_s,
-                    )
+            ep_elapsed = time.perf_counter() - ep_started
+            print(
+                f"[convert][{split_name}] episode done ep={ep_idx} rows={ep_count} "
+                f"elapsed={ep_elapsed:.2f}s",
+                flush=True,
+            )
 
-                    if executor is None:
-                        result = process_episode_worker(item)
-                        wrote = _write_pixels_result_to_files(file_handles, result)
-                        rows_written_pixels += wrote
-                        completed_episodes += 1
-                        for used in result.backend_used.values():
-                            fallback_counts[used] = fallback_counts.get(used, 0) + 1
-                        now = time.perf_counter()
-                        elapsed = now - started
-                        rate = rows_written_pixels / elapsed if elapsed > 0 else 0.0
-                        print(
-                            f"[convert][{split_name}] episode done ep={ep_idx} rows={wrote} "
-                            f"episodes={completed_episodes}/{len(episodes)} "
-                            f"rows={rows_written_pixels}/{total_rows} rate={rate:.1f} rows/s "
-                            f"backends={result.backend_used}",
-                            flush=True,
-                        )
-                    else:
-                        fut = executor.submit(process_episode_worker, item)
-                        pending[fut] = (int(ep_idx), row_start, row_stop)
-                        submitted_episodes += 1
-                        print(
-                            f"[convert][{split_name}] submitted ep={ep_idx} rows={ep_count} "
-                            f"submitted={submitted_episodes}/{len(episodes)} pending={len(pending)}",
-                            flush=True,
-                        )
-                        if len(pending) >= max_pending:
-                            flush_ready(block_until_one=True)
-
-                    rows_submitted += ep_count
-
-                while pending:
-                    flush_ready(block_until_one=True)
-
-            if rows_submitted != total_rows or rows_written_pixels != total_rows:
-                raise RuntimeError(
-                    f"Split '{split_name}' write mismatch: submitted={rows_submitted} "
-                    f"written_pixels={rows_written_pixels} total_rows={total_rows}"
+            should_log = (
+                rows_written == total_rows
+                or (
+                    cfg.progress_every > 0
+                    and rows_written % cfg.progress_every == 0
+                    and (time.perf_counter() - last_log) > 0.5
                 )
+                or (time.perf_counter() - last_log) >= cfg.heartbeat_seconds
+            )
+            if should_log:
+                now = time.perf_counter()
+                elapsed = now - started
+                rate = rows_written / elapsed if elapsed > 0 else 0.0
+                remaining = total_rows - rows_written
+                eta = remaining / rate if rate > 0 else float("inf")
+                pct = (100.0 * rows_written) / total_rows
+                print(
+                    f"[convert][{split_name}] {rows_written}/{total_rows} "
+                    f"({pct:.1f}%) rate={rate:.1f} rows/s eta={eta:.1f}s",
+                    flush=True,
+                )
+                last_log = now
 
-        finally:
-            if executor is not None:
-                executor.shutdown(wait=True, cancel_futures=False)
+        if rows_written != total_rows:
+            raise RuntimeError(
+                f"Split '{split_name}' write mismatch: written={rows_written} total_rows={total_rows}"
+            )
 
         print(
-            f"[convert][{split_name}] decode_backends_used={fallback_counts}",
+            f"[convert][{split_name}] decode_backends_used={backend_counts}",
             flush=True,
         )
     finally:
@@ -1066,31 +876,22 @@ def main(cfg: ConvertConfig) -> None:
         raise ValueError("progress_every must be >= 0.")
     if cfg.heartbeat_seconds <= 0:
         raise ValueError("heartbeat_seconds must be > 0.")
-    if cfg.auto_max_workers <= 0:
-        raise ValueError("auto_max_workers must be > 0.")
-    if cfg.episode_batch_size < 0:
-        raise ValueError("episode_batch_size must be >= 0.")
-    if cfg.max_pending_tasks < 0:
-        raise ValueError("max_pending_tasks must be >= 0.")
-    if cfg.num_workers < 0:
-        raise ValueError("num_workers must be >= 0.")
-    if cfg.memory_guard_mode not in VALID_MEMORY_GUARD_MODE:
-        raise ValueError(
-            f"Invalid memory_guard_mode '{cfg.memory_guard_mode}'. "
-            f"Expected one of {VALID_MEMORY_GUARD_MODE}."
-        )
-    if cfg.max_inflight_memory_ratio <= 0 or cfg.max_inflight_memory_ratio > 1:
-        raise ValueError("max_inflight_memory_ratio must be in (0, 1].")
-    if cfg.worker_memory_buffer_mb < 0:
-        raise ValueError("worker_memory_buffer_mb must be >= 0.")
+    if cfg.micro_batch_size <= 0:
+        raise ValueError("micro_batch_size must be > 0.")
+    if cfg.stall_timeout_seconds <= 0:
+        raise ValueError("stall_timeout_seconds must be > 0.")
 
-    if cfg.image_size is not None:
-        _ensure_torch_installed(auto_install=cfg.auto_install_torch)
+    decode_backend = _resolve_decode_backend(cfg)
+    if decode_backend not in VALID_DECODE_BACKEND:
+        raise ValueError(
+            f"Invalid decode_backend '{decode_backend}'. Expected one of {VALID_DECODE_BACKEND}."
+        )
+
+    _assert_runtime_dependencies()
+    _warn_deprecated_options(cfg)
 
     raw_root = Path(cfg.datasets_dir) / cfg.raw_subdir / cfg.repo_id
-    output_root = (
-        Path(cfg.datasets_dir) / cfg.hdf5_subdir / sanitize_repo_id(cfg.repo_id)
-    )
+    output_root = Path(cfg.datasets_dir) / cfg.hdf5_subdir / sanitize_repo_id(cfg.repo_id)
     report_path = output_root / cfg.report_filename
 
     meta_ds = LeRobotDataset(
@@ -1118,6 +919,7 @@ def main(cfg: ConvertConfig) -> None:
         "generated_at_utc": datetime.now(UTC).isoformat(),
         "repo_id": cfg.repo_id,
         "config": asdict(cfg),
+        "resolved_decode_backend": decode_backend,
         "splits": {},
         "status": "ok",
     }
@@ -1125,12 +927,7 @@ def main(cfg: ConvertConfig) -> None:
     print(
         "[convert] starting "
         f"repo_id={cfg.repo_id} splits={split_names} "
-        f"video_backend={cfg.video_backend or 'auto'}",
-        flush=True,
-    )
-    print(
-        "[convert] note: macOS objc AVF* duplicate warnings are typically non-fatal; "
-        "conversion should continue if progress logs keep updating.",
+        f"decode_backend={decode_backend} micro_batch={cfg.micro_batch_size}",
         flush=True,
     )
 
@@ -1162,9 +959,7 @@ def main(cfg: ConvertConfig) -> None:
             elif cfg.dirty_episode_policy == "drop":
                 action_taken = "drop_invalid"
                 invalid_set = set(invalid_episodes)
-                kept_episodes = [
-                    ep for ep in requested_episodes if ep not in invalid_set
-                ]
+                kept_episodes = [ep for ep in requested_episodes if ep not in invalid_set]
             else:
                 action_taken = "warn_only"
                 kept_episodes = requested_episodes
@@ -1211,6 +1006,7 @@ def main(cfg: ConvertConfig) -> None:
             root=raw_root,
             output_dir=output_root,
             camera_keys=selected_camera_keys,
+            decode_backend=decode_backend,
         )
         split_report["produced_files"] = produced
 

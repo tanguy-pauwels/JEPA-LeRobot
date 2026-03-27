@@ -42,20 +42,22 @@ python scripts/convert_lerobot_to_hdf5.py \
   --dirty_episode_policy=drop
 ```
 
-Recommended on laptops (safer memory profile):
+Recommended for Mac 8GB / Kaggle stability:
 
 ```bash
 python scripts/convert_lerobot_to_hdf5.py \
-  --num_workers=2 \
-  --max_pending_tasks=1 \
-  --memory_guard_mode=error
+  --decode_backend=pyav \
+  --micro_batch_size=64 \
+  --stall_timeout_seconds=120
 ```
 
 Notes:
 
-- `num_workers=0` uses conservative auto mode capped by `--auto_max_workers` (default: `2`).
-- `memory_guard_mode` can be `off`, `warn`, or `error`.
-- `max_inflight_memory_ratio` controls the guard threshold (default: `0.40`).
+- `decode_backend` supports `pyav` (default) and `opencv`; the converter automatically falls back to the other backend if initialization fails.
+- `micro_batch_size` controls RAM and I/O granularity; `64` is the default and HDF5 chunks are aligned to this value.
+- `stall_timeout_seconds` fails fast if no decode/write progress is observed for too long (default: `120`).
+- `num_workers` and previous parallelism/torch flags are kept for CLI compatibility but are deprecated and ignored in stable linear mode.
+- `heartbeat_seconds` controls periodic liveness logs (default: `10`).
 
 A machine-readable report is written to:
 
