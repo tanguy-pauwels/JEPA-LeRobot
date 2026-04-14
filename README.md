@@ -299,7 +299,7 @@ An example Rerun recording is included at [`assets/exemple_visualisation.rrd`](a
 rerun assets/exemple_visualisation.rrd
 ```
 
-<video src="assets/exemple_visualisation.mp4" autoplay loop muted playsinline width="100%"></video>
+![](assets/exemple_visualisation.gif)
 
 Open an HDF5 file directly:
 
