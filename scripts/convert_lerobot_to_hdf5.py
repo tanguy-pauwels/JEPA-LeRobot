@@ -283,17 +283,31 @@ def _require_pyav() -> Any:
 def _require_cv2() -> Any:
     if importlib.util.find_spec("cv2") is None:
         raise RuntimeError(
-            "Missing dependency 'opencv-python'. Install with: pip install opencv-python"
+            "Missing dependency 'opencv-python-headless'. "
+            "Install with: pip install opencv-python-headless"
         )
     import cv2
 
     return cv2
 
 
-def _assert_runtime_dependencies() -> None:
+def _assert_runtime_dependencies(decode_backend: str, image_size: int | None) -> None:
     _require_h5py()
-    _require_pyav()
-    _require_cv2()
+
+    available_backends = [
+        backend
+        for backend in _backend_order(decode_backend)
+        if importlib.util.find_spec("av" if backend == "pyav" else "cv2") is not None
+    ]
+    if not available_backends:
+        raise RuntimeError(
+            "Missing video decode dependency. Install at least one supported backend: "
+            "av for --decode_backend=pyav or opencv-python-headless for "
+            "--decode_backend=opencv."
+        )
+
+    if image_size is not None:
+        _require_cv2()
 
 
 def _normalize_frame_hwc_uint8(frame: np.ndarray) -> np.ndarray:
@@ -887,7 +901,7 @@ def main(cfg: ConvertConfig) -> None:
             f"Invalid decode_backend '{decode_backend}'. Expected one of {VALID_DECODE_BACKEND}."
         )
 
-    _assert_runtime_dependencies()
+    _assert_runtime_dependencies(decode_backend=decode_backend, image_size=cfg.image_size)
     _warn_deprecated_options(cfg)
 
     raw_root = Path(cfg.datasets_dir) / cfg.raw_subdir / cfg.repo_id

@@ -49,7 +49,7 @@ Not implemented in this repository yet:
 
 ```text
 .
-├── assets/                      # Example Rerun recording
+├── assets/                      # Example visualization preview
 ├── lewm_dataset_utils/          # Shared validation and path helpers
 ├── scripts/
 │   ├── download_lerobot_datasets.py
@@ -57,7 +57,7 @@ Not implemented in this repository yet:
 │   ├── inspect_validate_hdf5.py
 │   └── visualize_hdf5_rerun.py
 ├── tests/                       # Unit tests
-├── requirements.txt             # Pinned Python dependencies
+├── requirements.txt             # Minimal runtime dependencies
 └── README.md
 ```
 
@@ -65,7 +65,7 @@ Generated datasets are written under `datasets/`, which is ignored by Git.
 
 ## Installation
 
-Create a virtual environment and install the pinned dependencies:
+Create a virtual environment and install the runtime dependencies:
 
 ```bash
 python -m venv venv
@@ -292,12 +292,6 @@ python scripts/inspect_validate_hdf5.py \
 ## Visualize an episode with Rerun
 
 The Rerun viewer is used as a conversion sanity check: it displays the camera stream, action dimensions, state dimensions, `done`, `step_idx`, `episode_idx`, and session metadata on the `step` timeline.
-
-An example Rerun recording is included at [`assets/exemple_visualisation.rrd`](assets/exemple_visualisation.rrd). Open it with:
-
-```bash
-rerun assets/exemple_visualisation.rrd
-```
 
 ![](assets/exemple_visualisation.gif)
 

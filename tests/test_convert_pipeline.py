@@ -5,6 +5,7 @@ import importlib.util
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -39,6 +40,29 @@ class ConvertPipelineUnitTests(unittest.TestCase):
                 episode_index=1,
                 camera_key="observation.images.front",
             )
+
+    def test_dependency_check_allows_single_available_backend_without_resize(self) -> None:
+        def fake_find_spec(name: str) -> object | None:
+            if name == "av":
+                return object()
+            if name == "cv2":
+                return None
+            return object()
+
+        with patch.object(MODULE.importlib.util, "find_spec", side_effect=fake_find_spec):
+            MODULE._assert_runtime_dependencies(decode_backend="pyav", image_size=None)
+
+    def test_dependency_check_requires_cv2_for_resize(self) -> None:
+        def fake_find_spec(name: str) -> object | None:
+            if name == "av":
+                return object()
+            if name == "cv2":
+                return None
+            return object()
+
+        with patch.object(MODULE.importlib.util, "find_spec", side_effect=fake_find_spec):
+            with self.assertRaises(RuntimeError):
+                MODULE._assert_runtime_dependencies(decode_backend="pyav", image_size=224)
 
 
 @unittest.skipUnless(HAS_CV2, "opencv-python is not installed")
