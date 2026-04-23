@@ -12,7 +12,7 @@ from typing import Any, Iterator
 
 import draccus
 import numpy as np
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 
 try:
     import h5py
@@ -53,6 +53,7 @@ class ConvertConfig:
     hdf5_subdir: str = "hdf5"
     splits: list[str] = field(default_factory=list)
     camera_keys: list[str] = field(default_factory=list)
+    local_only: bool = False
     image_size: int | None = None
     compression: str = "lzf"
     overwrite: bool = False
@@ -82,6 +83,41 @@ class ConvertConfig:
 def _split_episodes(meta: Any, split_name: str) -> list[int]:
     split_spec = meta.info["splits"][split_name]
     return parse_episode_range(split_spec, total_episodes=meta.total_episodes)
+
+
+def _assert_local_metadata_exists(root: Path) -> None:
+    required = [root / "meta", root / "meta" / "info.json"]
+    missing = [path for path in required if not path.exists()]
+    if missing:
+        raise FileNotFoundError(
+            "Local-only conversion requested, but local LeRobot metadata is missing: "
+            f"{missing}. Expected a downloaded dataset under {root}."
+        )
+
+
+def _assert_local_episode_files(
+    root: Path,
+    meta: Any,
+    episodes: list[int],
+    camera_keys: list[str],
+) -> None:
+    missing: list[Path] = []
+    for ep_idx in episodes:
+        data_path = root / meta.get_data_file_path(ep_idx)
+        if not data_path.exists():
+            missing.append(data_path)
+        for camera_key in camera_keys:
+            video_path = root / meta.get_video_file_path(ep_idx, camera_key)
+            if not video_path.exists():
+                missing.append(video_path)
+
+    if missing:
+        preview = missing[:20]
+        suffix = "" if len(missing) <= len(preview) else f" ... and {len(missing) - len(preview)} more"
+        raise FileNotFoundError(
+            "Local-only conversion requested, but required local dataset files are missing: "
+            f"{preview}{suffix}"
+        )
 
 
 def _to_scalar(value: Any) -> Any:
@@ -908,20 +944,22 @@ def main(cfg: ConvertConfig) -> None:
     output_root = Path(cfg.datasets_dir) / cfg.hdf5_subdir / sanitize_repo_id(cfg.repo_id)
     report_path = output_root / cfg.report_filename
 
-    meta_ds = LeRobotDataset(
+    if cfg.local_only:
+        _assert_local_metadata_exists(raw_root)
+
+    meta = LeRobotDatasetMetadata(
         repo_id=cfg.repo_id,
         root=raw_root,
-        download_videos=False,
     )
-    all_split_names = list(meta_ds.meta.info["splits"].keys())
+    all_split_names = list(meta.info["splits"].keys())
     split_names = cfg.splits or all_split_names
     for split_name in split_names:
-        if split_name not in meta_ds.meta.info["splits"]:
+        if split_name not in meta.info["splits"]:
             raise ValueError(
                 f"Unknown split '{split_name}'. Available splits: {all_split_names}"
             )
 
-    all_camera_keys = list(meta_ds.meta.camera_keys)
+    all_camera_keys = list(meta.camera_keys)
     selected_camera_keys = cfg.camera_keys or all_camera_keys
     for camera_key in selected_camera_keys:
         if camera_key not in all_camera_keys:
@@ -946,7 +984,14 @@ def main(cfg: ConvertConfig) -> None:
     )
 
     for split_name in split_names:
-        requested_episodes = _split_episodes(meta_ds.meta, split_name)
+        requested_episodes = _split_episodes(meta, split_name)
+        if cfg.local_only:
+            _assert_local_episode_files(
+                root=raw_root,
+                meta=meta,
+                episodes=requested_episodes,
+                camera_keys=selected_camera_keys,
+            )
         print(
             f"[convert][{split_name}] pre-validating {len(requested_episodes)} episodes...",
             flush=True,

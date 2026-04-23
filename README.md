@@ -107,6 +107,7 @@ python scripts/download_lerobot_datasets.py \
   --force_cache_sync=false
 ```
 
+
 ### 2. Convert LeRobot Parquet/MP4 to HDF5
 
 Default conversion:
@@ -119,6 +120,25 @@ Default input:
 
 ```text
 datasets/raw/lerobot/koch_pick_place_1_lego/
+```
+
+The converter reads from the local raw dataset path by default:
+
+```text
+<datasets_dir>/<raw_subdir>/<repo_id>/
+```
+
+Use `--local_only=true` when the dataset has already been downloaded into
+`datasets/raw/` and you want conversion to fail instead of fetching missing
+files from Hugging Face:
+
+```bash
+python scripts/convert_lerobot_to_hdf5.py \
+  --repo_id=lerobot/droid_1.0.1 \
+  --datasets_dir=datasets/raw/lerobot/droid_1.0.1 \
+  --camera_keys='["observation.images.exterior_image_1_left"]' \
+  --local_only=true \
+  --overwrite=true
 ```
 
 Default output:
@@ -188,6 +208,15 @@ python scripts/convert_lerobot_to_hdf5.py \
   --decode_backend=pyav \
   --micro_batch_size=64 \
   --stall_timeout_seconds=120
+```
+
+```bash
+python scripts/convert_lerobot_to_hdf5.py \
+  --decode_backend=pyav \
+  --micro_batch_size=64 \
+  --stall_timeout_seconds=120 \
+  --image_size=224 \
+  --repo_id=lerobot/koch_pick_place_1_lego
 ```
 
 Supported decode backends:
