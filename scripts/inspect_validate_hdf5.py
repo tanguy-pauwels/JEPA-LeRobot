@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Inspect and validate LeWM HDF5 datasets."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 from pathlib import Path
 import sys
@@ -14,8 +14,10 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from lewm_dataset_utils import (  # noqa: E402
+    has_manifest,
     inspect_hdf5_file,
     list_hdf5_files,
+    resolve_manifest_hdf5_files,
     sanitize_repo_id,
     validate_hdf5_file,
 )
@@ -29,6 +31,9 @@ class InspectValidateConfig:
     target_path: str = (
         f"datasets/hdf5/{sanitize_repo_id(DEFAULT_DATASET)}"
     )
+    split: str | None = None
+    camera_key: str | None = None
+    shard_ids: list[str] = field(default_factory=list)
     output_json: str | None = None
     fail_on_error: bool = True
     strict_done: bool = True
@@ -40,7 +45,16 @@ def main(cfg: InspectValidateConfig) -> None:
         raise ValueError("mode must be 'inspect' or 'validate'.")
 
     target = Path(cfg.target_path)
-    files = list_hdf5_files(target)
+    shard_ids = cfg.shard_ids or []
+    if target.is_dir() and has_manifest(target):
+        files = resolve_manifest_hdf5_files(
+            target,
+            split=cfg.split,
+            camera_key=cfg.camera_key,
+            shard_ids=shard_ids,
+        )
+    else:
+        files = list_hdf5_files(target)
     if not files:
         raise FileNotFoundError(f"No .h5 file found under: {target}")
 

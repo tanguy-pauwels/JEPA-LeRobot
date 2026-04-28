@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Visualize LeWM HDF5 episodes in Rerun."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import importlib.util
 import json
 from pathlib import Path
@@ -16,7 +16,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from lewm_dataset_utils import list_hdf5_files  # noqa: E402
+from lewm_dataset_utils import (  # noqa: E402
+    has_manifest,
+    list_hdf5_files,
+    resolve_manifest_hdf5_files,
+)
 
 REQUIRED_KEYS = (
     "pixels",
@@ -35,6 +39,7 @@ class VisualizeHDF5Config:
     target_path: str = "datasets/hdf5"
     split: str | None = None
     camera_key: str | None = None
+    shard_ids: list[str] = field(default_factory=list)
     episode_index: int = 0
     start_step: int = 0
     end_step: int | None = None
@@ -81,15 +86,37 @@ def _match_camera_slug(candidate_slug: str, requested_camera_key: str) -> bool:
     return candidate_slug == req_slug or candidate_slug == requested_camera_key
 
 
-def _resolve_hdf5_file(target_path: Path, split: str | None, camera_key: str | None) -> Path:
+def _resolve_hdf5_file(
+    target_path: Path,
+    split: str | None,
+    camera_key: str | None,
+    shard_ids: list[str] | None = None,
+) -> Path:
     if target_path.is_file():
         if target_path.suffix != ".h5":
             raise ValueError(f"target_path must be a .h5 file, got: {target_path}")
         return target_path
 
-    candidates = list_hdf5_files(target_path)
+    manifest_mode = target_path.is_dir() and has_manifest(target_path)
+    if manifest_mode:
+        candidates = resolve_manifest_hdf5_files(
+            target_path,
+            split=split,
+            camera_key=camera_key,
+            shard_ids=shard_ids or [],
+        )
+    else:
+        candidates = list_hdf5_files(target_path)
     if not candidates:
         raise FileNotFoundError(f"No .h5 files found under: {target_path}")
+
+    if manifest_mode:
+        if len(candidates) == 1:
+            return candidates[0]
+        raise ValueError(
+            "Ambiguous selection: multiple manifest shard files matched filters. "
+            f"Please refine split/camera_key/shard_ids. Matches={[str(p) for p in candidates]}"
+        )
 
     filtered = candidates
     if split:
@@ -408,6 +435,7 @@ def main(cfg: VisualizeHDF5Config) -> None:
         target_path=target,
         split=cfg.split,
         camera_key=cfg.camera_key,
+        shard_ids=cfg.shard_ids,
     )
     rrd_path = Path(cfg.rrd_path) if cfg.rrd_path else _default_rrd_path(
         h5_path, cfg.episode_index

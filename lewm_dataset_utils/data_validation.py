@@ -244,6 +244,27 @@ def validate_hdf5_file(path: Path, strict_done: bool = True) -> list[str]:
                 f"Total rows mismatch: sum(ep_len)={total_from_meta}, rows={n_rows}."
             )
 
+        video_file_count = h5f.attrs.get("video_file_count")
+        video_segment_count = h5f.attrs.get("video_segment_count")
+        video_frame_write_count = h5f.attrs.get("video_frame_write_count")
+        if video_file_count is not None and int(video_file_count) <= 0:
+            errors.append("HDF5 attr 'video_file_count' must be > 0 when present.")
+        if video_segment_count is not None and int(video_segment_count) <= 0:
+            errors.append("HDF5 attr 'video_segment_count' must be > 0 when present.")
+        if (
+            video_file_count is not None
+            and video_segment_count is not None
+            and int(video_segment_count) < int(video_file_count)
+        ):
+            errors.append(
+                "HDF5 attr 'video_segment_count' must be >= 'video_file_count' when both are present."
+            )
+        if video_frame_write_count is not None and int(video_frame_write_count) != n_rows:
+            errors.append(
+                f"HDF5 attr 'video_frame_write_count' must match row count: "
+                f"{int(video_frame_write_count)} vs {n_rows}."
+            )
+
         for idx, (start, length) in enumerate(zip(ep_offset, ep_len)):
             start_i = int(start)
             length_i = int(length)
@@ -285,4 +306,3 @@ def validate_hdf5_file(path: Path, strict_done: bool = True) -> list[str]:
                     )
 
     return errors
-

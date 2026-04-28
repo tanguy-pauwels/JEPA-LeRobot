@@ -14,7 +14,7 @@ This repository currently focuses on that data bridge:
 
 A converted HDF5 version of the default dataset is available on Hugging Face at [`Tpauwels/lerobot-hdf5-koch_pick_place_1_lego`](https://huggingface.co/datasets/Tpauwels/lerobot-hdf5-koch_pick_place_1_lego).
 
-It does **not** currently include LeWM model training, CEM planning, MPC control, or Hugging Face upload automation for arbitrary converted HDF5 datasets.
+It does **not** currently include LeWM model training, CEM planning, or MPC control. It now includes optional shard-by-shard publication for converted HDF5 datasets.
 
 ## Why this exists
 
@@ -164,6 +164,42 @@ The converter creates one HDF5 file per selected split/camera pair. For example:
 datasets/hdf5/lerobot__koch_pick_place_1_lego/train__observation_images_laptop.h5
 ```
 
+For large datasets, the converter can also shard by episode count and publish synchronously to a Hugging Face dataset repo:
+
+```bash
+python scripts/convert_lerobot_to_hdf5.py \
+  --repo_id=lerobot/droid_1.0.1 \
+  --splits='["train"]' \
+  --camera_keys='["observation.images.exterior_1_left"]' \
+  --episode_count=10000 \
+  --local_only=true \
+  --prevalidate_source=false \
+  --shard_episode_count=500 \
+  --publish_repo_id=your-name/lerobot-hdf5-droid_1_0_1 \
+  --cleanup_local_shards_after_upload=true \
+  --overwrite=true
+```
+
+Shard mode writes a local manifest/state and stores shard files as:
+
+```text
+datasets/hdf5/<repo_sanitized>/
+├── manifest.json
+├── publish_state.json
+├── conversion_report.json
+└── <split>/
+    ├── shard-00000/
+    │   └── <camera_slug>.h5
+    └── shard-00001/
+        └── <camera_slug>.h5
+```
+
+The upload loop is synchronous:
+
+```text
+convert shard N -> upload shard N -> verify remote size -> delete local shard N -> convert shard N+1
+```
+
 The converted version of the default dataset is published at [`Tpauwels/lerobot-hdf5-koch_pick_place_1_lego`](https://huggingface.co/datasets/Tpauwels/lerobot-hdf5-koch_pick_place_1_lego).
 
 ### 3. Handle dirty episodes
@@ -195,6 +231,13 @@ A machine-readable report is written to:
 
 ```text
 datasets/hdf5/<repo_sanitized>/conversion_report.json
+```
+
+When shard publication is enabled, the converter also persists:
+
+```text
+datasets/hdf5/<repo_sanitized>/manifest.json
+datasets/hdf5/<repo_sanitized>/publish_state.json
 ```
 
 ### 4. Tune decoding and memory behavior
@@ -318,6 +361,17 @@ python scripts/inspect_validate_hdf5.py \
   --output_json=artifacts/hdf5_validation.json
 ```
 
+Validate one shard/camera selection from a manifest-based dataset:
+
+```bash
+python scripts/inspect_validate_hdf5.py \
+  --mode=validate \
+  --target_path=datasets/hdf5/lerobot__droid_1.0.1 \
+  --split=train \
+  --camera_key=observation.images.exterior_1_left \
+  --shard_ids='["shard-00003"]'
+```
+
 ## Visualize an episode with Rerun
 
 The Rerun viewer is used as a conversion sanity check: it displays the camera stream, action dimensions, state dimensions, `done`, `step_idx`, `episode_idx`, and session metadata on the `step` timeline.
@@ -340,6 +394,17 @@ python scripts/visualize_hdf5_rerun.py \
   --split=train \
   --camera_key=observation.images.laptop \
   --episode_index=3
+```
+
+Resolve a file from a shard-published dataset by split, camera, and shard id:
+
+```bash
+python scripts/visualize_hdf5_rerun.py \
+  --target_path=datasets/hdf5/lerobot__droid_1.0.1 \
+  --split=train \
+  --camera_key=observation.images.exterior_1_left \
+  --shard_ids='["shard-00003"]' \
+  --episode_index=0
 ```
 
 Visualize only a step window:

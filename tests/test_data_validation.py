@@ -75,6 +75,9 @@ class HDF5ValidationTests(unittest.TestCase):
             h5f.create_dataset("task_index", data=np.zeros((n_rows,), dtype=np.int64))
             h5f.create_dataset("ep_len", data=np.array([2, 2], dtype=np.int64))
             h5f.create_dataset("ep_offset", data=np.array([0, 2], dtype=np.int64))
+            h5f.attrs["video_file_count"] = 1
+            h5f.attrs["video_segment_count"] = 1
+            h5f.attrs["video_frame_write_count"] = n_rows
 
     def test_validate_hdf5_file_clean(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -99,7 +102,20 @@ class HDF5ValidationTests(unittest.TestCase):
             errors = validate_hdf5_file(h5_path, strict_done=True)
             self.assertTrue(any("before terminal step" in err for err in errors), errors)
 
+    def test_validate_hdf5_file_bad_video_provenance_attrs(self) -> None:
+        import h5py
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            h5_path = Path(tmpdir) / "bad_video_attrs.h5"
+            self._create_base_h5(h5_path, done_values=np.array([False, True, False, True]))
+            with h5py.File(h5_path, "a") as h5f:
+                h5f.attrs["video_file_count"] = 2
+                h5f.attrs["video_segment_count"] = 1
+                h5f.attrs["video_frame_write_count"] = 3
+            errors = validate_hdf5_file(h5_path, strict_done=True)
+            self.assertTrue(any("video_segment_count" in err for err in errors), errors)
+            self.assertTrue(any("video_frame_write_count" in err for err in errors), errors)
+
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -7,12 +7,12 @@ import tempfile
 import unittest
 
 import numpy as np
+from lewm_dataset_utils.sharded_hdf5 import atomic_write_json, shard_camera_relpath
 
 MODULE = importlib.import_module("scripts.visualize_hdf5_rerun")
 HAS_H5PY = importlib.util.find_spec("h5py") is not None
 
 
-@unittest.skipUnless(HAS_H5PY, "h5py is not installed")
 class VisualizePathResolutionTests(unittest.TestCase):
     def test_resolve_single_from_directory(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -28,6 +28,41 @@ class VisualizePathResolutionTests(unittest.TestCase):
             (root / "train__observation_images_wrist.h5").touch()
             with self.assertRaises(ValueError):
                 MODULE._resolve_hdf5_file(root, split="train", camera_key=None)
+
+    def test_resolve_from_manifest_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            manifest = {
+                "splits": {
+                    "train": {
+                        "shards": [
+                            {
+                                "shard_id": "shard-00000",
+                                "camera_files": {
+                                    "observation.images.front": str(
+                                        shard_camera_relpath(
+                                            "train",
+                                            "shard-00000",
+                                            "observation.images.front",
+                                        )
+                                    )
+                                },
+                            }
+                        ]
+                    }
+                }
+            }
+            atomic_write_json(root / "manifest.json", manifest)
+            target = root / "train" / "shard-00000" / "observation_images_front.h5"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.touch()
+            out = MODULE._resolve_hdf5_file(
+                root,
+                split="train",
+                camera_key="observation.images.front",
+                shard_ids=["shard-00000"],
+            )
+            self.assertEqual(target, out)
 
 
 @unittest.skipUnless(HAS_H5PY, "h5py is not installed")
