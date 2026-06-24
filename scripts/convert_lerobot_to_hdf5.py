@@ -105,6 +105,7 @@ def _column_to_numpy(dataset: Any, key: str) -> np.ndarray:
         out.append(_to_scalar(item))
     return np.asarray(out).reshape(-1)
 
+
 def _dataset_column_names(dataset_obj: Any) -> list[str]:
     """Return available column names for a LeRobotDataset across versions."""
     hf = getattr(dataset_obj, "hf_dataset", None)
@@ -130,6 +131,7 @@ def _derive_done_from_episode_index(episode_idx: np.ndarray) -> np.ndarray:
     if done.size > 1:
         done[:-1] = episode_idx[:-1] != episode_idx[1:]
     return done
+    
     
 def _select_columns_compat(dataset_obj: Any, columns: list[str]) -> Any:
     """Compatibility helper for LeRobotDataset versions with/without select_columns."""
