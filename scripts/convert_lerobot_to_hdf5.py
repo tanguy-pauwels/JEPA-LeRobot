@@ -106,6 +106,33 @@ def _column_to_numpy(dataset: Any, key: str) -> np.ndarray:
     return np.asarray(out).reshape(-1)
 
 
+def _dataset_column_names(dataset_obj: Any) -> list[str]:
+    """Return available column names for a LeRobotDataset across versions."""
+    hf = getattr(dataset_obj, "hf_dataset", None)
+    if hf is not None and hasattr(hf, "column_names"):
+        return list(hf.column_names)
+    if hasattr(dataset_obj, "column_names"):
+        return list(dataset_obj.column_names)
+    if hasattr(dataset_obj, "features"):
+        try:
+            return list(dataset_obj.features.keys())
+        except Exception:
+            pass
+    return []
+
+
+def _derive_done_from_episode_index(episode_idx: np.ndarray) -> np.ndarray:
+    """Mark the last frame of each contiguous episode as done=True."""
+    episode_idx = np.asarray(episode_idx).reshape(-1)
+    done = np.zeros(episode_idx.shape, dtype=np.bool_)
+    if done.size == 0:
+        return done
+    done[-1] = True
+    if done.size > 1:
+        done[:-1] = episode_idx[:-1] != episode_idx[1:]
+    return done
+    
+    
 def _select_columns_compat(dataset_obj: Any, columns: list[str]) -> Any:
     """Compatibility helper for LeRobotDataset versions with/without select_columns."""
     if hasattr(dataset_obj, "select_columns"):
@@ -212,8 +239,20 @@ def _values_to_matrix(values: Any, dtype: Any) -> np.ndarray:
 
 
 def _read_episode_tabular_slice(
-    columns_ds: Any, row_start: int, row_stop: int
+    columns_ds: Any, row_start: int, row_stop: int, has_next_done: bool = True
 ) -> dict[str, np.ndarray]:
+    episode_idx = _values_to_vector(
+        _slice_column_values(columns_ds, "episode_index", row_start, row_stop),
+        np.int64,
+    )
+    if has_next_done:
+        done = _values_to_vector(
+            _slice_column_values(columns_ds, "next.done", row_start, row_stop),
+            np.bool_,
+        )
+    else:
+        done = _derive_done_from_episode_index(episode_idx)
+
     return {
         "action": _values_to_matrix(
             _slice_column_values(columns_ds, "action", row_start, row_stop),
@@ -223,18 +262,12 @@ def _read_episode_tabular_slice(
             _slice_column_values(columns_ds, "observation.state", row_start, row_stop),
             np.float32,
         ),
-        "episode_idx": _values_to_vector(
-            _slice_column_values(columns_ds, "episode_index", row_start, row_stop),
-            np.int64,
-        ),
+        "episode_idx": episode_idx,
         "step_idx": _values_to_vector(
             _slice_column_values(columns_ds, "frame_index", row_start, row_stop),
             np.int64,
         ),
-        "done": _values_to_vector(
-            _slice_column_values(columns_ds, "next.done", row_start, row_stop),
-            np.bool_,
-        ),
+        "done": done,
         "timestamp": _values_to_vector(
             _slice_column_values(columns_ds, "timestamp", row_start, row_stop),
             np.float32,
@@ -525,12 +558,20 @@ def _prevalidate_source_split(
         episodes=episodes,
         download_videos=False,
     )
-    tiny = _select_columns_compat(
-        source_dataset, ["episode_index", "frame_index", "next.done"]
-    )
+    available = set(_dataset_column_names(source_dataset))
+    has_next_done = "next.done" in available
+
+    select_cols = ["episode_index", "frame_index"]
+    if has_next_done:
+        select_cols.append("next.done")
+
+    tiny = _select_columns_compat(source_dataset, select_cols)
     episode_idx = _column_to_numpy(tiny, "episode_index")
     step_idx = _column_to_numpy(tiny, "frame_index")
-    done = _column_to_numpy(tiny, "next.done")
+    if has_next_done:
+        done = _column_to_numpy(tiny, "next.done")
+    else:
+        done = _derive_done_from_episode_index(episode_idx)
 
     return collect_source_episode_issues(
         episode_idx=episode_idx,
@@ -685,7 +726,10 @@ def _convert_split(
             f"vs sum(ep_len)={total_rows}."
         )
 
-    cols = _select_columns_compat(ds, TABULAR_COLUMNS)
+    available_cols = set(_dataset_column_names(ds))
+    has_next_done = "next.done" in available_cols
+    select_cols = [c for c in TABULAR_COLUMNS if c != "next.done" or has_next_done]
+    cols = _select_columns_compat(ds, select_cols)
 
     first_cam = camera_keys[0]
     feat_shape = tuple(ds.meta.features[first_cam]["shape"])
@@ -716,8 +760,8 @@ def _convert_split(
         pixel_chunks = (chunk_rows,) + pixel_shape
         scalar_chunks = (chunk_rows,)
 
-        action_probe = _read_episode_tabular_slice(cols, 0, min(1, total_rows))["action"]
-        state_probe = _read_episode_tabular_slice(cols, 0, min(1, total_rows))["state"]
+        action_probe = _read_episode_tabular_slice(cols, 0, min(1, total_rows), has_next_done)["action"]
+        state_probe = _read_episode_tabular_slice(cols, 0, min(1, total_rows), has_next_done)["state"]
         action_dim = int(action_probe.shape[1])
         state_dim = int(state_probe.shape[1])
 
@@ -796,7 +840,7 @@ def _convert_split(
                 flush=True,
             )
 
-            tabular = _read_episode_tabular_slice(cols, row_start, row_stop)
+            tabular = _read_episode_tabular_slice(cols, row_start, row_stop, has_next_done)
             _write_tabular_slice_to_all_files(file_handles, row_slice, tabular)
 
             for camera in camera_keys:
